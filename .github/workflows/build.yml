@@ -1,0 +1,129 @@
+name: build
+on:
+  push:
+
+env:
+  # Disable keepAlive and pool
+  # https://github.com/actions/virtual-environments/issues/1499#issuecomment-689467080
+  MAVEN_OPTS: >-
+    -Xms1024M -Xmx2048M -XX:MaxMetaspaceSize=1024m -XX:-UseGCOverheadLimit
+    -Dhttp.keepAlive=false
+    -Dmaven.wagon.http.pool=false
+    -Dmaven.wagon.http.retryHandler.count=3
+  MAVEN_ARGS: >-
+    -B --no-transfer-progress
+  # ZEPPELIN_MODULES: zeppelin-distribution,zeppelin-web,zeppelin-server,zeppelin-plugins,spark-submit,spark,angular,markdown,shell,jdbc
+  # ZEPPELIN_MODULES: "!alluxio,!bigquery,!cassandra,!elasticsearch,!file,!flink,!flink-cmd,!flink/flink-shims,!flink/flink1.12-shims,!flink/flink1.13-shims,!flink/flink1.14-shims,!flink/flink1.15-shims,!flink/flink-scala-parent,!flink/flink-scala-2.11,!flink/flink-scala-2.12,!groovy,!hbase,!influxdb,!jdbc,!java,!livy,!mongodb,!neo4j,!sparql,!submarine,!zeppelin-plugins/launcher/yarn,!zeppelin-plugins/launcher/cluster,!zeppelin-plugins/launcher/docker,!zeppelin-plugins/launcher/flink"
+  ZEPPELIN_MODULES: "!alluxio,!bigquery,!cassandra,!elasticsearch,!file,!flink,!groovy,!hbase,!influxdb,!jdbc,!java,!livy,!mongodb,!neo4j,!sparql,!submarine,!zeppelin-plugins/launcher/yarn,!zeppelin-plugins/launcher/cluster,!zeppelin-plugins/launcher/docker,!zeppelin-plugins/launcher/flink"
+  RELEASE_VERSION: 0.11.0-SNAPSHOT
+  DOCKER_HUB_NAMESPACE: khwj
+
+# Use the bash login, because we are using miniconda
+defaults:
+  run:
+    shell: bash -l {0}
+
+jobs:
+  build-binary:
+    runs-on: ubuntu-20.04
+    permissions:
+      contents: read # to fetch code (actions/checkout)
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        hadoop: [hadoop2, hadoop3]
+        # python: [3.7]
+        # spark: [spark-3.2, spark-3.3]
+        # scala: [scala-2.12, scala-2.13]
+        # exclude:
+        #   - spark: spark-3.2
+        #     scala: scala-2.13
+    env:
+      BIN_RELEASE_NAME: ${{ matrix.hadoop }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Tune Runner VM
+        uses: ./.github/actions/tune-runner-vm
+      - name: Set up JDK 8
+        uses: actions/setup-java@v3
+        with:
+          distribution: "temurin"
+          java-version: 8
+      - name: Cache local Maven repository
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.m2/repository
+            !~/.m2/repository/org/apache/zeppelin/
+            ~/.spark-dist
+            ~/.cache
+          key: ${{ runner.os }}-zeppelin-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-zeppelin-
+      - name: Build Zeppelin Binary 
+        run: |
+          ./mvnw clean package -DskipTests -DskipRat -Pbuild-distr -P${{ matrix.hadoop }} -Pweb-angular -am -pl ${ZEPPELIN_MODULES}
+          cd zeppelin-distribution/target/zeppelin-${RELEASE_VERSION}
+          mv zeppelin-* "zeppelin-${RELEASE_VERSION}-bin-${BIN_RELEASE_NAME}"
+          cat ../../src/bin_license/LICENSE >> "zeppelin-${RELEASE_VERSION}-bin-${BIN_RELEASE_NAME}/LICENSE"
+          cat ../../src/bin_license/NOTICE >> "zeppelin-${RELEASE_VERSION}-bin-${BIN_RELEASE_NAME}/NOTICE"
+          cp ../../src/bin_license/licenses/* "zeppelin-${RELEASE_VERSION}-bin-${BIN_RELEASE_NAME}/licenses/"
+          tar -cvzf "zeppelin-${RELEASE_VERSION}-bin-${BIN_RELEASE_NAME}.tgz" "zeppelin-${RELEASE_VERSION}-bin-${BIN_RELEASE_NAME}"
+      - name: Archive Zeppelin binary
+        uses: actions/upload-artifact@v3
+        with:
+          name: zeppelin-${{ env.RELEASE_VERSION }}-bin-${{ env.BIN_RELEASE_NAME }}
+          path: |
+            zeppelin-distribution/target/zeppelin-${{ env.RELEASE_VERSION }}/zeppelin-${{ env.RELEASE_VERSION }}-bin-${{ env.BIN_RELEASE_NAME }}.tgz
+      - name: Download binary
+        uses: actions/download-artifact@v3
+        with:
+          name: zeppelin-${{ env.RELEASE_VERSION }}-bin-${{ env.BIN_RELEASE_NAME }}
+          path: scripts/docker/zeppelin/bin
+      - name: Log in to the Container registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: |
+            ${{ env.DOCKER_HUB_NAMESPACE }}/${{ github.repository }}
+            ghcr.io/${{ github.repository }}
+      - name: Build and push
+        uses: docker/build-push-action@v3
+        if: ${{ matrix.hadoop == 'hadoop3' }}
+        with:
+          context: ./scripts/docker/zeppelin/bin
+          file: ./scripts/docker/zeppelin/bin/Dockerfile.snapshot
+          build-args: |
+            Z_VERSION=${{ env.RELEASE_VERSION }}
+            BIN_RELEASE_NAME=${{ env.BIN_RELEASE_NAME }}
+            HADOOP_VERSION=3.3.1
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ env.RELEASE_VERSION }}-${{ env.BIN_RELEASE_NAME }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            zeppelin.version=${{ env.RELEASE_VERSION }}
+            hadoop.version=3.3.1
+      - name: Build and push
+        uses: docker/build-push-action@v3
+        if: ${{ matrix.hadoop == 'hadoop2' }}
+        with:
+          context: ./scripts/docker/zeppelin/bin
+          file: ./scripts/docker/zeppelin/bin/Dockerfile.snapshot
+          build-args: |
+            Z_VERSION=${{ env.RELEASE_VERSION }}
+            BIN_RELEASE_NAME=${{ env.BIN_RELEASE_NAME }}
+            HADOOP_VERSION=2.7.5
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ env.RELEASE_VERSION }}-${{ env.BIN_RELEASE_NAME }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            zeppelin.version=${{ env.RELEASE_VERSION }}
+            hadoop.version=2.7.5
